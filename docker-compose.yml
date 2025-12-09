@@ -1,0 +1,12 @@
+version: "3.9"
+
+services:
+  eth-forecast-api:
+    build: .
+    container_name: eth-forecast-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Share your local data & models with the container
+      - ./data:/app/data
+      - ./models:/app/models
