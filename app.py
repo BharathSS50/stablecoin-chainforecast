@@ -197,28 +197,125 @@ def health():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
 
-@app.get("/forecast-next-24h", response_model=ForecastResponse)
+@app.get("/forecast-next-24h")
 def forecast_next_24h_endpoint():
+    """
+    Return next-24h gas price forecast in the 'chains' format you specified.
+    forecast_value from the model is avg_gas_price in WEI.
+    We expose pred_fee_native as gas price in GWEI for readability.
+    """
     try:
-        fc = get_or_build_forecast()
+        fc = get_or_build_forecast()  # DataFrame with columns: timestamp, forecast_value, generated_at
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-    generated_at = pd.to_datetime(fc["generated_at"].iloc[0], utc=True)
+    # Top-level metadata
+    run_ts = datetime.now(timezone.utc)
+    run_ts_iso = run_ts.isoformat()
 
-    points = [
-        ForecastPoint(
-            timestamp=row["timestamp"].to_pydatetime(),
-            forecast_value=float(row["forecast_value"]),
+    csv_name = ETH_DATA_PATH.name  # e.g. "eth_hourly.csv"
+
+    # ---------------------------------
+    # Last observed gas price from CSV
+    # ---------------------------------
+    last_timestamp_iso = None
+    last_gas_price_native = None  # we'll expose this in "gas_price"
+
+    try:
+        df = pd.read_csv(ETH_DATA_PATH)
+        df["hour_utc"] = pd.to_datetime(df["hour_utc"], utc=True)
+        df = df.sort_values("hour_utc")
+        last_row = df.iloc[-1]
+        last_timestamp_iso = last_row["hour_utc"].isoformat()
+        # avg_gas_price is in WEI → convert to GWEI for readability
+        last_gas_price_native = float(last_row["avg_gas_price"]) / 1e9
+    except Exception:
+        # If anything fails, leave last_* as None
+        pass
+
+    # ---------------------------------
+    # Train/val sizes (approx from meta)
+    # ---------------------------------
+    train_size = 0
+    val_size = 0
+    metrics = {
+        "model_mae": 0.0,
+        "model_rmse": 0.0,
+        "model_mape": 0.0,
+        "model_r2": 0.0,
+        "baseline_mae": 0.0,
+        "baseline_rmse": 0.0,
+        "baseline_mape": 0.0,
+    }
+
+    try:
+        with open(META_PATH, "r") as f:
+            meta = json.load(f)
+
+        rows_used = int(meta.get("rows_used", 0))
+        train_size = int(rows_used * 0.8)
+        val_size = rows_used - train_size
+        # If later you save metrics into meta, you can read them here.
+    except Exception:
+        pass
+
+    # ---------------------------------
+    # Build forecast list
+    # ---------------------------------
+    fc_sorted = fc.sort_values("timestamp")
+
+    forecast = []
+    for _, row in fc_sorted.iterrows():
+        ts = pd.to_datetime(row["timestamp"], utc=True)
+        gas_price_wei = float(row["forecast_value"])
+        gas_price_gwei = gas_price_wei / 1e9  # convert WEI → GWEI
+
+        forecast.append(
+            {
+                "forecast_time": ts.isoformat(),
+                "pred_fee_native": gas_price_gwei,
+            }
         )
-        for _, row in fc.iterrows()
-    ]
 
-    return ForecastResponse(
-        generated_at=generated_at,
-        horizon_hours=FORECAST_HOURS,
-        points=points,
-    )
+    # ---------------------------------
+    # Summary: min / max predicted fee
+    # ---------------------------------
+    if forecast:
+        min_item = min(forecast, key=lambda x: x["pred_fee_native"])
+        max_item = max(forecast, key=lambda x: x["pred_fee_native"])
+    else:
+        min_item = None
+        max_item = None
+
+    eth_chain_payload = {
+        "chain": "eth",
+        "is_constant_fee": False,
+        "run_timestamp": run_ts_iso,
+        "csv_name": csv_name,
+        "forecast_hours": FORECAST_HOURS,
+        "train_size": train_size,
+        "val_size": val_size,
+        "metrics": metrics,
+        "last_observed": {
+            "timestamp": last_timestamp_iso,
+            "gas_price": last_gas_price_native,
+        },
+        "forecast": forecast,
+        "summary": {
+            "min_fee": min_item,
+            "max_fee": max_item,
+        },
+    }
+
+    # Top-level response in your format
+    resp = {
+        "run_timestamp": run_ts_iso,
+        "csv_name": csv_name,
+        "forecast_hours": FORECAST_HOURS,
+        "chains": [eth_chain_payload],  # only ETH for now
+    }
+
+    return JSONResponse(content=resp)
 
 
 # Optional: warm up on startup
